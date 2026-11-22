@@ -2299,8 +2299,70 @@ bool IRGeneratorForStatements::visit(InlineAssembly const& _inlineAsm)
 }
 
 
+bool IRGeneratorForStatements::visit(IndexAccess const& _indexAccess)
+{
+	std::optional<DirectStorageMappingIndex> direct = directStorageMappingIndex(_indexAccess);
+	if (!direct)
+		return true;
+
+	m_directMappingIndexes.insert(&_indexAccess);
+	setLocation(_indexAccess);
+	auto const& rootType = dynamic_cast<MappingType const&>(type(*direct->root));
+	std::string base;
+	if (auto const* identifier = dynamic_cast<Identifier const*>(direct->root))
+	{
+		auto const* variable = dynamic_cast<VariableDeclaration const*>(
+			identifier->annotation().referencedDeclaration
+		);
+		solAssert(variable, "");
+		auto const& location = m_context.storageLocationOfStateVariable(*variable);
+		solAssert(location.second == 0, "");
+		base = formatNumber(location.first);
+	}
+	else
+	{
+		auto const& member = dynamic_cast<MemberAccess const&>(*direct->root);
+		member.expression().accept(*this);
+		auto const& structType = dynamic_cast<StructType const&>(type(member.expression()));
+		solAssert(structType.location() == DataLocation::Storage, "");
+		auto const& offsets = structType.storageOffsetsOfMember(member.memberName());
+		solAssert(offsets.second == 0, "");
+		base =
+			"add(" + IRVariable(member.expression()).part("slot").name() +
+			", " + offsets.first.str() + ")";
+	}
+
+	MappingType const* current = &rootType;
+	std::vector<std::string> keyNames;
+	for (Expression const* key: direct->keys)
+	{
+		solAssert(current, "");
+		IRVariable converted = evaluateExpression(*key, *current->keyType());
+		solAssert(converted.type().sizeOnStack() == 1, "");
+		keyNames.push_back(converted.commaSeparatedList());
+		current = dynamic_cast<MappingType const*>(current->valueType());
+	}
+	solAssert(!current, "");
+
+	std::string slot = m_context.newYulVariable();
+	std::string arguments = std::move(base);
+	for (std::string const& keyName: keyNames)
+		arguments += ", " + keyName;
+	appendCode() <<
+		"let " << slot << " := " <<
+		m_utils.mappingDirectSlotFunction(rootType) <<
+		"(" << arguments << ")\n";
+	setLValue(_indexAccess, IRLValue{
+		*_indexAccess.annotation().type,
+		IRLValue::Storage{slot, 0u}
+	});
+	return false;
+}
+
 void IRGeneratorForStatements::endVisit(IndexAccess const& _indexAccess)
 {
+	if (m_directMappingIndexes.count(&_indexAccess))
+		return;
 	setLocation(_indexAccess);
 	Type const& baseType = *_indexAccess.baseExpression().annotation().type;
 
@@ -2318,13 +2380,21 @@ void IRGeneratorForStatements::endVisit(IndexAccess const& _indexAccess)
 		templ("base", IRVariable(_indexAccess.baseExpression()).commaSeparatedList());
 		templ("key", IRVariable(*_indexAccess.indexExpression()).commaSeparatedList());
 		appendCode() << templ.render();
-		setLValue(_indexAccess, IRLValue{
-			*_indexAccess.annotation().type,
-			IRLValue::Storage{
-				slot,
-				0u
-			}
-		});
+		// A nested mapping result is already a descriptor. Wrapping it again
+		// would treat that pointer as a storage slot.
+		bool const nestedResult =
+			StorageLayoutScope::active() &&
+			_indexAccess.annotation().type->category() == Type::Category::Mapping;
+		if (nestedResult && !_indexAccess.annotation().willBeWrittenTo)
+			define(IRVariable(_indexAccess)) << slot << "\n";
+		else
+			setLValue(_indexAccess, IRLValue{
+				*_indexAccess.annotation().type,
+				IRLValue::Storage{
+					slot,
+					0u
+				}
+			});
 	}
 	else if (baseType.category() == Type::Category::Array || baseType.category() == Type::Category::ArraySlice)
 	{
@@ -3221,7 +3291,18 @@ IRVariable IRGeneratorForStatements::readFromLValue(IRLValue const& _lvalue)
 	IRVariable result{m_context.newYulVariable(), _lvalue.type};
 	std::visit(GenericVisitor{
 		[&](IRLValue::Storage const& _storage) {
-			if (!_lvalue.type.isValueType())
+			if (
+				StorageLayoutScope::active() &&
+				_lvalue.type.category() == Type::Category::Mapping
+			)
+				define(result) <<
+					m_utils.mappingStorageRefFunction(
+						dynamic_cast<MappingType const&>(_lvalue.type)
+					) <<
+					"(" <<
+					_storage.slot <<
+					")\n";
+			else if (!_lvalue.type.isValueType())
 				define(result) << _storage.slot << "\n";
 			else if (std::holds_alternative<std::string>(_storage.offset))
 				define(result) <<

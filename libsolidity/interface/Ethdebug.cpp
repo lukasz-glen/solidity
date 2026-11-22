@@ -19,6 +19,7 @@
 #include <libsolidity/interface/Ethdebug.h>
 
 #include <libsolidity/ast/AST.h>
+#include <libsolidity/ast/ASTUtils.h>
 #include <libsolidity/ast/CallGraph.h>
 #include <libsolidity/ast/Types.h>
 #include <libsolidity/interface/EthdebugPointerTemplateRegistry.h>
@@ -57,6 +58,7 @@ void ethdebug::Resources::merge(Resources _other)
 
 ethdebug::Resources ethdebug::resources(ContractDefinition const& _contract, std::map<std::string, unsigned> const& _sourceIndices)
 {
+	StorageLayoutScope layoutScope(_contract.annotation().experimentalStorageLayoutV2);
 	TypeRegistry types{_sourceIndices};
 
 	auto const* typeType = dynamic_cast<TypeType const*>(_contract.type());

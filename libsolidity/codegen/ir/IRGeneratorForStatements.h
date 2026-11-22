@@ -27,6 +27,7 @@
 #include <libsolidity/interface/OptimiserSettings.h>
 
 #include <functional>
+#include <set>
 
 namespace solidity::frontend
 {
@@ -128,6 +129,7 @@ public:
 	bool visit(MemberAccess const& _memberAccess) override;
 	void endVisit(MemberAccess const& _memberAccess) override;
 	bool visit(InlineAssembly const& _inlineAsm) override;
+	bool visit(IndexAccess const& _indexAccess) override;
 	void endVisit(IndexAccess const& _indexAccess) override;
 	void endVisit(IndexRangeAccess const& _indexRangeAccess) override;
 	void endVisit(Identifier const& _identifier) override;
@@ -251,6 +253,8 @@ private:
 	std::function<std::string()> m_placeholderCallback;
 	YulUtilFunctions& m_utils;
 	std::optional<IRLValue> m_currentLValue;
+	/// Outermost indexes already compiled as a direct StorageLayoutV2 slot.
+	std::set<IndexAccess const*> m_directMappingIndexes;
 	OptimiserSettings m_optimiserSettings;
 	/// Whether to use checked or wrapping arithmetic.
 	Arithmetic m_currentArithmeticMode = Arithmetic::Checked;

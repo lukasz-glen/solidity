@@ -23,6 +23,7 @@
 
 #include <libsolidity/codegen/Compiler.h>
 
+#include <libsolidity/ast/ASTUtils.h>
 #include <libsolidity/codegen/ContractCompiler.h>
 #include <libevmasm/Assembly.h>
 
@@ -48,6 +49,8 @@ void Compiler::compileContract(
 		ranges::none_of(_contract.stateVariables(), isTransientReferenceType),
 		"Transient storage reference type variables are not supported."
 	);
+
+	StorageLayoutScope layoutScope(_contract.annotation().experimentalStorageLayoutV2);
 
 	ContractCompiler runtimeCompiler(nullptr, m_runtimeContext, m_optimiserSettings);
 	runtimeCompiler.compileContract(_contract, _otherCompilers);

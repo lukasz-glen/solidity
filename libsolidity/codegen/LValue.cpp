@@ -24,6 +24,7 @@
 #include <libsolidity/codegen/LValue.h>
 
 #include <libsolidity/ast/AST.h>
+#include <libsolidity/ast/ASTUtils.h>
 #include <libsolidity/ast/Types.h>
 #include <libsolidity/codegen/CompilerUtils.h>
 #include <libevmasm/Instruction.h>
@@ -243,6 +244,18 @@ void GenericStorageItem<IsTransient>::retrieveValue(langutil::SourceLocation con
 			m_context << Instruction::POP; // remove byte offset
 		else
 			m_context << Instruction::DUP2;
+		// StorageLayoutV2 mapping references carry their keys in a memory descriptor.
+		if (
+			StorageLayoutScope::active() &&
+			m_dataType->category() == Type::Category::Mapping
+		)
+			m_context.callYulFunction(
+				m_context.utilFunctions().mappingStorageRefFunction(
+					dynamic_cast<MappingType const&>(*m_dataType)
+				),
+				1,
+				1
+			);
 		return;
 	}
 	if (!_remove)

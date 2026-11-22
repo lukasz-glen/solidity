@@ -92,6 +92,10 @@ private:
 	void checkStorageSize(ContractDefinition const& _contract);
 	/// Checks if the storage layout specifier is properly assigned in the inheritance tree and not applied to an abstract contract
 	void checkStorageLayoutSpecifier(ContractDefinition const& _contract);
+	/// Rejects dynamically-sized storage types when this contract itself enables StorageLayoutV2.
+	/// The setting is taken from this contract's source file only. Inherited contracts do not
+	/// enable or disable it, but their state variables are part of this contract's storage layout.
+	void checkStorageLayoutV2(ContractDefinition const& _contract);
 
 	OverrideChecker m_overrideChecker;
 	langutil::ErrorReporter& m_errorReporter;

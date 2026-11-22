@@ -23,6 +23,10 @@
 
 #include <libsolutil/Algorithms.h>
 
+#include <algorithm>
+#include <set>
+#include <vector>
+
 namespace solidity::frontend
 {
 
@@ -156,4 +160,209 @@ std::optional<u256> erc7201CompileTimeValue(FunctionCall const& _erc7201Call)
 	solAssert(baseSlot <= std::numeric_limits<u256>::max());
 	return u256(baseSlot);
 }
+
+namespace
+{
+
+bigint storageSlotCountImpl(
+	Type const& _type,
+	bool _storageLayoutV2,
+	std::set<StructDefinition const*>& _stack
+);
+
+/// Same packing as StorageOffsets::computeOffsets, but the total may exceed 2**256.
+bigint packedStorageSlotCount(
+	std::vector<Type const*> const& _types,
+	bool _storageLayoutV2,
+	std::set<StructDefinition const*>& _stack
+)
+{
+	bigint slotOffset = 0;
+	unsigned byteOffset = 0;
+	for (Type const* type: _types)
+	{
+		solAssert(type, "");
+		solAssert(type->canBeStored(), "");
+		solAssert(type->storageBytes() <= 32, "");
+		unsigned const bytes = type->storageBytes();
+		if (byteOffset + bytes > 32)
+		{
+			++slotOffset;
+			byteOffset = 0;
+		}
+		bigint const size = storageSlotCountImpl(*type, _storageLayoutV2, _stack);
+		solAssert(size >= 1, "");
+		if (size == 1 && byteOffset + bytes <= 32)
+			byteOffset += bytes;
+		else
+		{
+			slotOffset += size;
+			byteOffset = 0;
+		}
+	}
+	if (byteOffset > 0)
+		++slotOffset;
+	return slotOffset;
+}
+
+bigint storageSlotCountImpl(
+	Type const& _type,
+	bool _storageLayoutV2,
+	std::set<StructDefinition const*>& _stack
+)
+{
+	if (auto const* mappingType = dynamic_cast<MappingType const*>(&_type))
+	{
+		if (!_storageLayoutV2)
+			return 1;
+		// Nested mappings are flattened: the whole chain reserves one 2**160 range,
+		// sized by the first value that is not itself a mapping.
+		Type const* value = mappingType->valueType();
+		solAssert(value, "");
+		while (auto const* inner = dynamic_cast<MappingType const*>(value))
+			value = inner->valueType();
+		bigint const valueSlots = storageSlotCountImpl(*value, true, _stack);
+		solAssert(valueSlots >= 1, "");
+		return (bigint(1) << 160) * valueSlots;
+	}
+	if (auto const* arrayType = dynamic_cast<ArrayType const*>(&_type))
+	{
+		if (arrayType->isDynamicallySized())
+			return 1;
+		unsigned const baseBytes = arrayType->baseType()->storageBytes();
+		if (baseBytes == 0)
+			return 1;
+		if (baseBytes < 32)
+		{
+			unsigned const itemsPerSlot = 32 / baseBytes;
+			bigint const size = (bigint(arrayType->length()) + (itemsPerSlot - 1)) / itemsPerSlot;
+			return size < 1 ? bigint(1) : size;
+		}
+		bigint const baseSlots = storageSlotCountImpl(
+			*arrayType->baseType(),
+			_storageLayoutV2,
+			_stack
+		);
+		bigint const size = bigint(arrayType->length()) * baseSlots;
+		return size < 1 ? bigint(1) : size;
+	}
+	if (auto const* structType = dynamic_cast<StructType const*>(&_type))
+	{
+		if (!_stack.insert(&structType->structDefinition()).second)
+			return bigint(1) << 256;
+		std::vector<Type const*> members;
+		for (auto const& member: structType->members(nullptr))
+			members.push_back(member.type);
+		bigint const size = packedStorageSlotCount(members, _storageLayoutV2, _stack);
+		_stack.erase(&structType->structDefinition());
+		return size < 1 ? bigint(1) : size;
+	}
+	return 1;
+}
+
+}
+
+thread_local bool StorageLayoutScope::s_active = false;
+
+StorageLayoutScope::StorageLayoutScope(bool _enabled):
+	m_previous(s_active)
+{
+	s_active = _enabled;
+}
+
+StorageLayoutScope::~StorageLayoutScope()
+{
+	s_active = m_previous;
+}
+
+bool StorageLayoutScope::active()
+{
+	return s_active;
+}
+
+bigint storageSlotCount(Type const& _type, bool _storageLayoutV2)
+{
+	std::set<StructDefinition const*> stack;
+	return storageSlotCountImpl(_type, _storageLayoutV2, stack);
+}
+
+bigint contractStorageSize(ContractDefinition const& _contract, bool _storageLayoutV2)
+{
+	std::vector<Type const*> types;
+	auto const& bases = _contract.annotation().linearizedBaseContracts;
+	for (auto base = bases.rbegin(); base != bases.rend(); ++base)
+		for (VariableDeclaration const* variable: (*base)->stateVariables())
+			if (
+				!(variable->isConstant() || variable->immutable()) &&
+				variable->referenceLocation() == VariableDeclaration::Location::Unspecified
+			)
+			{
+				solAssert(variable->annotation().type, "");
+				types.push_back(variable->annotation().type);
+			}
+	std::set<StructDefinition const*> stack;
+	return packedStorageSlotCount(types, _storageLayoutV2, stack);
+}
+
+namespace
+{
+
+bool isRawMappingSlot(Expression const& _expression)
+{
+	if (auto const* identifier = dynamic_cast<Identifier const*>(&_expression))
+	{
+		auto const* variable = dynamic_cast<VariableDeclaration const*>(
+			identifier->annotation().referencedDeclaration
+		);
+		if (
+			!variable ||
+			!variable->isStateVariable() ||
+			variable->isConstant() ||
+			variable->immutable() ||
+			variable->referenceLocation() != VariableDeclaration::Location::Unspecified
+		)
+			return false;
+		Type const* variableType = type(*variable);
+		return variableType && variableType->category() == Type::Category::Mapping;
+	}
+	if (auto const* member = dynamic_cast<MemberAccess const*>(&_expression))
+	{
+		auto const* structType = dynamic_cast<StructType const*>(type(member->expression()));
+		if (!structType || structType->location() != DataLocation::Storage)
+			return false;
+		Type const* memberType = structType->memberType(member->memberName());
+		return memberType && memberType->category() == Type::Category::Mapping;
+	}
+	return false;
+}
+
+}
+
+std::optional<DirectStorageMappingIndex> directStorageMappingIndex(IndexAccess const& _index)
+{
+	if (!StorageLayoutScope::active())
+		return std::nullopt;
+	Type const* resultType = type(_index);
+	if (!resultType || resultType->category() == Type::Category::Mapping)
+		return std::nullopt;
+
+	std::vector<Expression const*> keys;
+	Expression const* current = &_index;
+	while (auto const* access = dynamic_cast<IndexAccess const*>(current))
+	{
+		Type const* baseType = type(access->baseExpression());
+		if (!baseType || baseType->category() != Type::Category::Mapping)
+			break;
+		if (!access->indexExpression())
+			return std::nullopt;
+		keys.push_back(access->indexExpression());
+		current = &access->baseExpression();
+	}
+	current = resolveOuterUnaryTuples(current);
+	if (!current || keys.empty() || !isRawMappingSlot(*current))
+		return std::nullopt;
+	std::reverse(keys.begin(), keys.end());
+	return DirectStorageMappingIndex{current, std::move(keys)};
+}
+
 }

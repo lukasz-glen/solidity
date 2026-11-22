@@ -1,0 +1,155 @@
+{
+    "contracts": {
+        "v1.sol": {
+            "A": {
+                "storageLayout": {
+                    "storage": [
+                        {
+                            "astId": 3,
+                            "contract": "v1.sol:A",
+                            "label": "a",
+                            "offset": 0,
+                            "slot": "0",
+                            "type": "t_uint256"
+                        },
+                        {
+                            "astId": 7,
+                            "contract": "v1.sol:A",
+                            "label": "m",
+                            "offset": 0,
+                            "slot": "1",
+                            "type": "t_mapping(t_uint256,t_uint256)"
+                        },
+                        {
+                            "astId": 9,
+                            "contract": "v1.sol:A",
+                            "label": "b",
+                            "offset": 0,
+                            "slot": "2",
+                            "type": "t_uint256"
+                        }
+                    ],
+                    "types": {
+                        "t_mapping(t_uint256,t_uint256)": {
+                            "encoding": "mapping",
+                            "key": "t_uint256",
+                            "label": "mapping(uint256 => uint256)",
+                            "numberOfBytes": "32",
+                            "value": "t_uint256"
+                        },
+                        "t_uint256": {
+                            "encoding": "inplace",
+                            "label": "uint256",
+                            "numberOfBytes": "32"
+                        }
+                    }
+                }
+            }
+        },
+        "v2.sol": {
+            "A": {
+                "storageLayout": {
+                    "storage": [
+                        {
+                            "astId": 20,
+                            "contract": "v2.sol:A",
+                            "label": "a",
+                            "offset": 0,
+                            "slot": "0",
+                            "type": "t_uint8"
+                        },
+                        {
+                            "astId": 24,
+                            "contract": "v2.sol:A",
+                            "label": "m",
+                            "offset": 0,
+                            "slot": "1",
+                            "type": "t_mapping(t_uint256,t_uint256)"
+                        },
+                        {
+                            "astId": 26,
+                            "contract": "v2.sol:A",
+                            "label": "b",
+                            "offset": 0,
+                            "slot": "1461501637330902918203684832716283019655932542977",
+                            "type": "t_uint8"
+                        },
+                        {
+                            "astId": 31,
+                            "contract": "v2.sol:A",
+                            "label": "pairs",
+                            "offset": 0,
+                            "slot": "1461501637330902918203684832716283019655932542978",
+                            "type": "t_mapping(t_uint256,t_struct(Pair)18_storage)"
+                        },
+                        {
+                            "astId": 33,
+                            "contract": "v2.sol:A",
+                            "label": "c",
+                            "offset": 0,
+                            "slot": "4384504911992708754611054498148849058967797628930",
+                            "type": "t_uint256"
+                        }
+                    ],
+                    "types": {
+                        "t_mapping(t_uint256,t_struct(Pair)18_storage)": {
+                            "encoding": "mapping",
+                            "key": "t_uint256",
+                            "label": "mapping(uint256 => struct Pair)",
+                            "numberOfBytes": "93536104789177786765035829293842113257979682750464",
+                            "value": "t_struct(Pair)18_storage"
+                        },
+                        "t_mapping(t_uint256,t_uint256)": {
+                            "encoding": "mapping",
+                            "key": "t_uint256",
+                            "label": "mapping(uint256 => uint256)",
+                            "numberOfBytes": "46768052394588893382517914646921056628989841375232",
+                            "value": "t_uint256"
+                        },
+                        "t_struct(Pair)18_storage": {
+                            "encoding": "inplace",
+                            "label": "struct Pair",
+                            "members": [
+                                {
+                                    "astId": 15,
+                                    "contract": "v2.sol:A",
+                                    "label": "x",
+                                    "offset": 0,
+                                    "slot": "0",
+                                    "type": "t_uint256"
+                                },
+                                {
+                                    "astId": 17,
+                                    "contract": "v2.sol:A",
+                                    "label": "y",
+                                    "offset": 0,
+                                    "slot": "1",
+                                    "type": "t_uint256"
+                                }
+                            ],
+                            "numberOfBytes": "64"
+                        },
+                        "t_uint256": {
+                            "encoding": "inplace",
+                            "label": "uint256",
+                            "numberOfBytes": "32"
+                        },
+                        "t_uint8": {
+                            "encoding": "inplace",
+                            "label": "uint8",
+                            "numberOfBytes": "1"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "sources": {
+        "v1.sol": {
+            "id": 0
+        },
+        "v2.sol": {
+            "id": 1
+        }
+    }
+}

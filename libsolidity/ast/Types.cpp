@@ -2318,6 +2318,12 @@ bigint StructType::storageSizeUpperBound() const
 
 u256 StructType::storageSize() const
 {
+	if (StorageLayoutScope::active())
+	{
+		bigint const size = storageSlotCount(*this, true);
+		solAssert(size >= 1 && size < (bigint(1) << 256), "Struct too large for storage.");
+		return u256(size);
+	}
 	return std::max<u256>(1, members(nullptr).storageSize());
 }
 
@@ -2564,8 +2570,37 @@ FunctionTypePointer StructType::constructorType() const
 	);
 }
 
+StorageOffsets const& StructType::storageOffsetsV2() const
+{
+	solAssert(StorageLayoutScope::active(), "");
+	return m_storageOffsetsV2.init([&]{
+		TypePointers memberTypes;
+		for (auto const& member: members(nullptr))
+			memberTypes.push_back(member.type);
+		StorageOffsets offsets;
+		offsets.computeOffsets(memberTypes);
+		return offsets;
+	});
+}
+
 std::pair<u256, unsigned> const& StructType::storageOffsetsOfMember(std::string const& _name) const
 {
+	if (StorageLayoutScope::active())
+	{
+		size_t index = 0;
+		for (auto const& member: members(nullptr))
+		{
+			if (member.name == _name)
+			{
+				auto const* offset = storageOffsetsV2().offset(index);
+				solAssert(offset, "Storage offset of non-existing member requested.");
+				return *offset;
+			}
+			++index;
+		}
+		solAssert(false, "Storage offset of non-existing member requested.");
+		util::unreachable();
+	}
 	auto const* offsets = members(nullptr).memberStorageOffset(_name);
 	solAssert(offsets, "Storage offset of non-existing member requested.");
 	return *offsets;
@@ -3839,6 +3874,16 @@ bool FunctionType::padArguments() const
 		return true;
 	}
 	return true;
+}
+
+u256 MappingType::storageSize() const
+{
+	if (!StorageLayoutScope::active())
+		return 1;
+	// StorageLayoutV2 is active, so we need to check the mapping size.
+	bigint const size = storageSlotCount(*this, true);
+	solAssert(size >= 1 && size < (bigint(1) << 256), "Mapping too large for storage.");
+	return u256(size);
 }
 
 Type const* MappingType::encodingType() const

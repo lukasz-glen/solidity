@@ -32,7 +32,10 @@ enum class ExperimentalFeature
 	ABIEncoderV2, // new ABI encoder that makes use of Yul
 	SMTChecker,
 	Test,
-	TestOnlyAnalysis
+	TestOnlyAnalysis,
+	// Disallow dynamically-sized storage. A mapping reserves one 2**160-slot
+	// range; nested mappings share that range.
+	StorageLayoutV2
 };
 
 static std::set<ExperimentalFeature> const ExperimentalFeatureWithoutWarning =
@@ -40,6 +43,7 @@ static std::set<ExperimentalFeature> const ExperimentalFeatureWithoutWarning =
 	ExperimentalFeature::ABIEncoderV2,
 	ExperimentalFeature::SMTChecker,
 	ExperimentalFeature::TestOnlyAnalysis,
+	ExperimentalFeature::StorageLayoutV2,
 };
 
 static std::map<std::string, ExperimentalFeature> const ExperimentalFeatureNames =
@@ -47,7 +51,8 @@ static std::map<std::string, ExperimentalFeature> const ExperimentalFeatureNames
 	{ "ABIEncoderV2", ExperimentalFeature::ABIEncoderV2 },
 	{ "SMTChecker", ExperimentalFeature::SMTChecker },
 	{ "__test", ExperimentalFeature::Test },
-	{ "__testOnlyAnalysis", ExperimentalFeature::TestOnlyAnalysis }
+	{ "__testOnlyAnalysis", ExperimentalFeature::TestOnlyAnalysis },
+	{ "StorageLayoutV2", ExperimentalFeature::StorageLayoutV2 }
 };
 
 }

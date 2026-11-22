@@ -1,0 +1,18 @@
+{
+	"language": "Solidity",
+	"sources": {
+		"v1.sol": {
+			"content": "// SPDX-License-Identifier: GPL-3.0\npragma solidity >=0.0;\ncontract A { uint a; mapping(uint => uint) m; uint b; }"
+		},
+		"v2.sol": {
+			"content": "// SPDX-License-Identifier: GPL-3.0\npragma solidity >=0.0;\npragma experimental StorageLayoutV2;\nstruct Pair { uint x; uint y; }\ncontract A { uint8 a; mapping(uint => uint) m; uint8 b; mapping(uint => Pair) pairs; uint c; }"
+		}
+	},
+	"settings": {
+		"outputSelection": {
+			"*": {
+				"*": [ "storageLayout" ]
+			}
+		}
+	}
+}

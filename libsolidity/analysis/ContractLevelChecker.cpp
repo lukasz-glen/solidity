@@ -24,6 +24,7 @@
 
 #include <libsolidity/ast/AST.h>
 #include <libsolidity/ast/ASTUtils.h>
+#include <libsolidity/ast/ASTVisitor.h>
 #include <libsolidity/ast/TypeProvider.h>
 #include <libsolidity/analysis/TypeChecker.h>
 #include <libsolutil/FunctionSelector.h>
@@ -33,6 +34,8 @@
 
 #include <range/v3/algorithm/find_if.hpp>
 #include <range/v3/view/reverse.hpp>
+
+#include <set>
 
 using namespace solidity;
 using namespace solidity::langutil;
@@ -61,6 +64,115 @@ std::map<ASTString, std::vector<T const*>> filterDeclarations(
 	return filteredDeclarations;
 }
 
+/// True if ``_type`` is, or contains, a dynamically-sized storage type
+/// (``string``, ``bytes`` or a dynamically-sized array), including through
+/// structs, arrays and mapping keys or values. Mapping types themselves are allowed.
+bool containsDynamicallySizedStorageType(
+	Type const& _type,
+	std::set<StructDefinition const*>& _visitedStructs
+)
+{
+	if (auto const* arrayType = dynamic_cast<ArrayType const*>(&_type))
+	{
+		if (arrayType->isDynamicallySized())
+			return true;
+		return containsDynamicallySizedStorageType(*arrayType->baseType(), _visitedStructs);
+	}
+	if (auto const* mappingType = dynamic_cast<MappingType const*>(&_type))
+		return
+			containsDynamicallySizedStorageType(*mappingType->keyType(), _visitedStructs) ||
+			containsDynamicallySizedStorageType(*mappingType->valueType(), _visitedStructs);
+	if (auto const* structType = dynamic_cast<StructType const*>(&_type))
+	{
+		if (!_visitedStructs.insert(&structType->structDefinition()).second)
+			return false;
+		for (auto const& member: structType->structDefinition().members())
+		{
+			if (!member->type())
+				continue;
+			if (containsDynamicallySizedStorageType(*member->type(), _visitedStructs))
+				return true;
+		}
+		return false;
+	}
+	if (auto const* userDefinedValueType = dynamic_cast<UserDefinedValueType const*>(&_type))
+		return containsDynamicallySizedStorageType(
+			userDefinedValueType->underlyingType(),
+			_visitedStructs
+		);
+	return false;
+}
+
+bool containsDynamicallySizedStorageType(Type const& _type)
+{
+	std::set<StructDefinition const*> visitedStructs;
+	return containsDynamicallySizedStorageType(_type, visitedStructs);
+}
+
+bool storageLayoutV2TooLarge(Type const& _type)
+{
+	return storageSlotCount(_type, true) >= (bigint(1) << 256);
+}
+
+void reportStorageLayoutV2Overflow(
+	ErrorReporter& _reporter,
+	ContractDefinition const& _contract,
+	VariableDeclaration const& _variable,
+	Type const& _type
+)
+{
+	SecondarySourceLocation secondary;
+	if (_variable.annotation().contract && _variable.annotation().contract != &_contract)
+		secondary.append(
+			"Experimental StorageLayoutV2 is enabled for this contract "
+			"and applies to the whole inheritance hierarchy.",
+			_contract.location()
+		);
+	_reporter.typeError(
+		7455_error,
+		_variable.location(),
+		secondary,
+		fmt::format(
+			"Type \"{}\" does not fit into storage for contract \"{}\" "
+			"under experimental StorageLayoutV2. "
+			"A mapping reserves 2**160 slots for each slot of its value type. "
+			"Nested mappings share one such range. "
+			"The layout must fit into 2**256 slots.",
+			_type.toString(true),
+			_contract.name()
+		)
+	);
+}
+
+/// Storage references whose own slot reservation does not fit, other than state variables.
+class OversizedStorageReferenceChecker: public ASTConstVisitor
+{
+public:
+	OversizedStorageReferenceChecker(
+		ErrorReporter& _reporter,
+		ContractDefinition const& _contract
+	):
+		m_reporter(_reporter), m_contract(_contract) {}
+
+	void check(ASTNode const& _node) { _node.accept(*this); }
+
+	void endVisit(VariableDeclaration const& _variable) override
+	{
+		if (_variable.isStateVariable() || _variable.isConstant() || _variable.immutable())
+			return;
+		if (_variable.referenceLocation() != VariableDeclaration::Location::Storage)
+			return;
+		Type const* type = _variable.annotation().type;
+		if (!type || !storageLayoutV2TooLarge(*type))
+			return;
+		reportStorageLayoutV2Overflow(m_reporter, m_contract, _variable, *type);
+	}
+
+private:
+	ErrorReporter& m_reporter;
+	ContractDefinition const& m_contract;
+};
+
 }
 
 bool ContractLevelChecker::check(SourceUnit const& _sourceUnit)
@@ -86,6 +198,10 @@ bool ContractLevelChecker::check(SourceUnit const& _sourceUnit)
 bool ContractLevelChecker::check(ContractDefinition const& _contract)
 {
 	_contract.annotation().unimplementedDeclarations = std::vector<Declaration const*>();
+	_contract.annotation().experimentalStorageLayoutV2 =
+		_contract.sourceUnit().annotation().experimentalFeatures.contains(
+			ExperimentalFeature::StorageLayoutV2
+		);
 
 	checkDuplicateFunctions(_contract);
 	checkDuplicateEvents(_contract);
@@ -100,6 +216,7 @@ bool ContractLevelChecker::check(ContractDefinition const& _contract)
 	checkPayableFallbackWithoutReceive(_contract);
 	checkStorageSize(_contract);
 	checkStorageLayoutSpecifier(_contract);
+	checkStorageLayoutV2(_contract);
 
 	return !Error::containsErrors(m_errorReporter.errors());
 }
@@ -589,12 +706,86 @@ void ContractLevelChecker::checkPayableFallbackWithoutReceive(ContractDefinition
 			);
 }
 
+void ContractLevelChecker::checkStorageLayoutV2(ContractDefinition const& _contract)
+{
+	if (!_contract.annotation().experimentalStorageLayoutV2)
+		return;
+
+	for (ContractDefinition const* contract: _contract.annotation().linearizedBaseContracts)
+		for (VariableDeclaration const* variable: contract->stateVariables())
+		{
+			if (variable->isConstant() || variable->immutable())
+				continue;
+			if (variable->referenceLocation() != VariableDeclaration::Location::Unspecified)
+				continue;
+			Type const* type = variable->type();
+			if (!type || !containsDynamicallySizedStorageType(*type))
+				continue;
+
+			SecondarySourceLocation secondary;
+			if (contract != &_contract)
+				secondary.append(
+					"Experimental StorageLayoutV2 is enabled for this contract "
+					"and applies to the whole inheritance hierarchy.",
+					_contract.location()
+				);
+
+			m_errorReporter.typeError(
+				2735_error,
+				variable->location(),
+				secondary,
+				fmt::format(
+					"Type \"{}\" is not allowed in storage for contract \"{}\" "
+					"under experimental StorageLayoutV2. "
+					"Dynamically-sized types (string, bytes and arrays) are forbidden, "
+					"including inside structs and as mapping keys or values.",
+					type->toString(true),
+					_contract.name()
+				)
+			);
+		}
+
+	OversizedStorageReferenceChecker references(m_errorReporter, _contract);
+	for (ContractDefinition const* contract: _contract.annotation().linearizedBaseContracts)
+	{
+		for (FunctionDefinition const* function: contract->definedFunctions())
+			references.check(*function);
+		for (ModifierDefinition const* modifier: contract->functionModifiers())
+			references.check(*modifier);
+	}
+	for (ASTPointer<ASTNode> const& node: _contract.sourceUnit().nodes())
+		if (auto const* function = dynamic_cast<FunctionDefinition const*>(node.get()))
+			references.check(*function);
+}
+
 void ContractLevelChecker::checkStorageSize(ContractDefinition const& _contract)
 {
 	using enum VariableDeclaration::Location;
+	bool const storageLayoutV2 = _contract.annotation().experimentalStorageLayoutV2;
+	bool reportedOversizedVariable = false;
+	if (storageLayoutV2)
+		for (ContractDefinition const* contract: _contract.annotation().linearizedBaseContracts)
+			for (VariableDeclaration const* variable: contract->stateVariables())
+			{
+				if (variable->isConstant() || variable->immutable())
+					continue;
+				if (variable->referenceLocation() != Unspecified)
+					continue;
+				Type const* type = variable->annotation().type;
+				if (!type || !storageLayoutV2TooLarge(*type))
+					continue;
+				reportedOversizedVariable = true;
+				reportStorageLayoutV2Overflow(m_errorReporter, _contract, *variable, *type);
+			}
+
 	for (VariableDeclaration::Location location: {Unspecified, Transient})
 	{
-		bigint size = contractStorageSizeUpperBound(_contract, location);
+		bigint size =
+			storageLayoutV2 && location == Unspecified ?
+			contractStorageSize(_contract, true) :
+			contractStorageSizeUpperBound(_contract, location);
+		if (reportedOversizedVariable && location == Unspecified)
+			continue;
 		if (size >= bigint(1) << 256)
 		{
 			if (location == Unspecified)

@@ -169,6 +169,69 @@ analysis may not be fully sound.
     The ``SMTChecker`` pragma is deprecated and will be removed.
     To enable SMTChecker, simply select :ref:`select an engine<smtchecker_engines>` when invoking the compiler.
 
+.. index:: ! pragma; StorageLayoutV2
+
+StorageLayoutV2
+~~~~~~~~~~~~~~~
+
+``pragma experimental StorageLayoutV2`` flags every contract defined in that
+source file as using the experimental storage layout.
+
+The flag belongs to the contract that is defined in the file. It is not
+inherited. A derived contract uses StorageLayoutV2 only when its own source
+file contains the pragma. Pragmas on intermediate or base contracts are ignored
+when deciding whether the derived contract uses the layout.
+
+When a contract is flagged, dynamically-sized types are not allowed anywhere in
+its storage layout. This includes ``string``, ``bytes`` and dynamically-sized
+arrays, also when they are nested inside structs or fixed-size arrays, and when
+they are used as mapping keys or values. Mappings of statically-sized types
+remain allowed, as do fixed-size arrays of statically-sized types.
+The restriction covers state variables declared in the contract itself and in
+every base contract. Constants and immutables are not stored in storage and are
+unaffected. Types used only in memory or calldata are unaffected.
+
+A mapping in a flagged contract reserves ``2**160`` storage slots for every
+slot its leaf value occupies. The leaf is the value type after nested mappings
+have been skipped. A value type such as ``uint`` or ``address`` occupies one
+slot. A struct or a fixed-size array occupies more when it does not fit in a
+single slot. The entry ``m[k]`` is stored at
+
+.. code-block:: text
+
+    slot(m) + offset(k) * slots(leaf)
+
+``offset(k)`` is the key itself when the key type occupies at most 160 bits.
+An ``address``, ``uint160`` or ``bytes20`` key uses those 160 bits directly,
+so an ``address`` key is stored at ``slot(m) + k``. Shorter keys, such as
+``uint8`` and ``bool``, are used the same way. A wider key is hashed:
+``offset(k)`` is the last 20 bytes of ``keccak256`` of the key padded to a
+32-byte word, the same padding the default layout uses. The hash does not
+include the mapping's slot.
+The next state variable starts after the reserved range.
+
+Nested mappings share that one range and one offset. The keys are taken
+together. When their bit widths sum to at most 160, ``offset`` is the
+concatenation of those keys, the outer key in the higher bits. Two ``uint8``
+keys therefore use ``slot(m) + (k1 * 256 + k2)``. When the widths sum to more
+than 160 bits, ``offset`` is the last 20 bytes of one ``keccak256`` of the
+padded keys concatenated (``k1 || k2 || ...``). A third level appends ``k3``
+to that same hash. ``mapping(address => mapping(address => uint))`` reserves
+``2**160`` slots and uses the hash, because two addresses are 320 bits.
+A storage pointer to an inner mapping, such as
+``mapping(address => uint) storage inner = m[k1]``, keeps the keys already
+applied. ``inner[k2]`` uses the same combined offset.
+A mapping inside a struct is not part of this chain. The struct is the leaf,
+and the mapping inside the struct has its own base slot.
+
+A layout that does not fit into ``2**256`` slots is an error. A struct that
+contains a mapping already occupies that mapping's range, so a mapping of
+such a struct can be too large.
+
+Internal library functions are compiled into the calling contract and follow
+that contract's flag. An external library function is compiled with the
+library, so it follows the library's own flag.
+
 .. index:: source file, ! import, module, source unit
 
 .. _import:

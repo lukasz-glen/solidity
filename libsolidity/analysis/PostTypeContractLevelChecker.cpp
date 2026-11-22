@@ -183,7 +183,9 @@ void PostTypeContractLevelChecker::checkStorageLayoutSpecifier(ContractDefinitio
 
 	storageLayoutSpecifier->annotation().baseSlot = u256(baseSlot);
 
-	bigint size = contractStorageSizeUpperBound(_contract, VariableDeclaration::Location::Unspecified);
+	bigint size = _contract.annotation().experimentalStorageLayoutV2 ?
+		contractStorageSize(_contract, true) :
+		contractStorageSizeUpperBound(_contract, VariableDeclaration::Location::Unspecified);
 	solAssert(size < bigint(1) << 256);
 	if (baseSlot + size >= bigint(1) << 256)
 		m_errorReporter.typeError(
@@ -222,7 +224,9 @@ void PostTypeContractLevelChecker::warnStorageLayoutBaseNearStorageEnd(ContractD
 	if (Error::containsErrors(m_errorReporter.errors()))
 		return;
 
-	bigint storageSize = contractStorageSizeUpperBound(_contract, VariableDeclaration::Location::Unspecified);
+	bigint storageSize = _contract.annotation().experimentalStorageLayoutV2 ?
+		contractStorageSize(_contract, true) :
+		contractStorageSizeUpperBound(_contract, VariableDeclaration::Location::Unspecified);
 	u256 baseSlot = layoutBaseForInheritanceHierarchy(_contract, DataLocation::Storage);
 	solAssert(baseSlot + storageSize <= std::numeric_limits<u256>::max());
 

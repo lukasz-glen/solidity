@@ -26,6 +26,7 @@
 #include <libsolidity/codegen/ir/IRGeneratorForStatements.h>
 
 #include <libsolidity/ast/AST.h>
+#include <libsolidity/ast/ASTUtils.h>
 #include <libsolidity/ast/ASTVisitor.h>
 #include <libsolidity/codegen/ABIFunctions.h>
 #include <libsolidity/codegen/CompilerUtils.h>
@@ -103,6 +104,8 @@ std::string IRGenerator::generate(
 	std::map<ContractDefinition const*, std::string_view const> const& _otherYulSources
 )
 {
+	StorageLayoutScope layoutScope(_contract.annotation().experimentalStorageLayoutV2);
+
 	auto subObjectSources = [&_otherYulSources](UniqueVector<ContractDefinition const*> const& _subObjects) -> std::string
 	{
 		std::string subObjectsSources;
@@ -616,11 +619,49 @@ std::string IRGenerator::generateGetter(VariableDeclaration const& _varDecl)
 		// index access, reassign the yul variable `slot` and move @a currentType further "down".
 		// The initial value of @a currentType is only used if we skip the loop completely.
 		Type const* currentType = _varDecl.annotation().type;
+		// True once ``slot`` is a StorageLayoutV2 mapping descriptor rather than a raw slot.
+		bool slotIsMappingRef = false;
 
 		std::vector<std::string> parameters;
 		std::vector<std::string> returnVariables;
 
-		for (size_t i = 0; i < paramTypes.size(); ++i)
+		// Consume a complete mapping chain in one call. Later parameters, if any,
+		// are static-array indexes and keep using the raw slot.
+		size_t paramIndex = 0;
+		if (
+			StorageLayoutScope::active() &&
+			!paramTypes.empty() &&
+			dynamic_cast<MappingType const*>(currentType)
+		)
+		{
+			auto const& rootMapping = dynamic_cast<MappingType const&>(*currentType);
+			std::vector<std::string> directKeys;
+			while (auto const* mappingType = dynamic_cast<MappingType const*>(currentType))
+			{
+				if (paramIndex >= paramTypes.size())
+					break;
+				std::vector<std::string> keys = IRVariable(
+					"key_" + std::to_string(paramIndex),
+					*mappingType->keyType()
+				).stackSlots();
+				solAssert(keys.size() == 1, "");
+				parameters += keys;
+				directKeys += keys;
+				currentType = mappingType->valueType();
+				++paramIndex;
+			}
+			solAssert(
+				!dynamic_cast<MappingType const*>(currentType),
+				"Getter has fewer parameters than mapping levels."
+			);
+			code +=
+				"slot := " +
+				m_utils.mappingDirectSlotFunction(rootMapping) +
+				"(slot, " + joinHumanReadable(directKeys) + ")\n";
+			code += "offset := 0\n";
+		}
+
+		for (size_t i = paramIndex; i < paramTypes.size(); ++i)
 		{
 			MappingType const* mappingType = dynamic_cast<MappingType const*>(currentType);
 			ArrayType const* arrayType = dynamic_cast<ArrayType const*>(currentType);
@@ -648,7 +689,16 @@ std::string IRGenerator::generateGetter(VariableDeclaration const& _varDecl)
 			if (arrayType)
 				templ("length", m_utils.arrayLengthFunction(*arrayType));
 
+			if (mappingType && StorageLayoutScope::active() && !slotIsMappingRef)
+				code +=
+					"slot := " +
+					m_utils.mappingStorageRefFunction(*mappingType) +
+					"(slot)\n";
 			code += templ.render();
+			slotIsMappingRef =
+				StorageLayoutScope::active() &&
+				mappingType &&
+				mappingType->valueType()->category() == Type::Category::Mapping;
 
 			currentType = mappingType ? mappingType->valueType() : arrayType->baseType();
 		}

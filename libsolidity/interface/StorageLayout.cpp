@@ -18,6 +18,7 @@
 
 #include <libsolidity/interface/StorageLayout.h>
 
+#include <libsolidity/ast/ASTUtils.h>
 #include <libsolidity/ast/TypeProvider.h>
 
 using namespace std::literals;
@@ -27,6 +28,9 @@ using namespace solidity::frontend;
 Json StorageLayout::generate(ContractDefinition const& _contractDef, DataLocation const _location)
 {
 	solAssert(!m_contract, "");
+	StorageLayoutScope layoutScope(
+		_location == DataLocation::Storage && _contractDef.annotation().experimentalStorageLayoutV2
+	);
 	m_contract = &_contractDef;
 	m_types.clear();
 
@@ -71,7 +75,9 @@ void StorageLayout::generate(Type const* _type)
 	// Register it now to cut recursive visits.
 	Json& typeInfo = m_types[typeKeyName(_type)];
 	typeInfo["label"] = _type->toString(true);
-	typeInfo["numberOfBytes"] = u256(_type->storageBytes() * _type->storageSize()).str();
+	typeInfo["numberOfBytes"] = (
+		bigint(_type->storageBytes()) * bigint(_type->storageSize())
+	).str();
 
 	if (auto structType = dynamic_cast<StructType const*>(_type))
 	{

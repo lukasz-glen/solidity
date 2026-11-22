@@ -1082,10 +1082,15 @@ protected:
 	std::vector<Type const*> decomposition() const override;
 
 private:
+	/// Storage member offsets for experimental StorageLayoutV2.
+	/// Kept apart from MemberList, whose cache is the default layout.
+	StorageOffsets const& storageOffsetsV2() const;
+
 	StructDefinition const& m_struct;
 	// Caches for interfaceType(bool)
 	mutable std::optional<TypeResult> m_interfaceType;
 	mutable std::optional<TypeResult> m_interfaceType_library;
+	mutable util::LazyInit<StorageOffsets> m_storageOffsetsV2;
 };
 
 /**
@@ -1570,6 +1575,7 @@ public:
 	/// Cannot be stored in memory, but just in case.
 	bool hasSimpleZeroValueInMemory() const override { solAssert(false, ""); }
 	bool nameable() const override { return true; }
+	u256 storageSize() const override;
 
 	std::vector<std::tuple<std::string, Type const*>> makeStackItems() const override;
 

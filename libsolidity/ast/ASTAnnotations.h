@@ -172,6 +172,10 @@ struct ContractDefinitionAnnotation: TypeDeclarationAnnotation, StructurallyDocu
 
 	// Per-contract map from function AST IDs to internal dispatch function IDs.
 	std::map<FunctionDefinition const*, uint64_t> internalFunctionIDs;
+
+	/// True if this contract's own source file enables experimental StorageLayoutV2.
+	/// Not copied from base contracts.
+	bool experimentalStorageLayoutV2 = false;
 };
 
 struct StorageLayoutSpecifierAnnotation: ASTAnnotation

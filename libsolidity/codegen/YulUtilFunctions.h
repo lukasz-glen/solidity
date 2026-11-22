@@ -350,6 +350,24 @@ public:
 	/// @param _keyType the type of the value provided
 	std::string mappingIndexAccessFunction(MappingType const& _mappingType, Type const& _keyType);
 
+	/// Yul statements that assign the StorageLayoutV2 entry slot of a fully
+	/// keyed mapping to @_result. @_keys are converted keys, outer key first.
+	/// One or two hashed keys use the scratch space. Wider hashes allocate.
+	std::string mappingDirectSlotCode(
+		MappingType const& _type,
+		std::string const& _base,
+		std::vector<std::string> const& _keys,
+		std::string const& _result
+	) const;
+
+	/// ``(base, key0, key1, ...) -> dataSlot`` for a fully keyed mapping.
+	std::string mappingDirectSlotFunction(MappingType const& _type);
+
+	/// StorageLayoutV2 mapping reference, tagged for the whole chain of @_type.
+	/// Hash (tag 0): ``{0, base, key count, key0, key1, ...}``.
+	/// Pack (tag 1): ``{1, base, bits filled, packed keys}``. ``(slot) -> ref``.
+	std::string mappingStorageRefFunction(MappingType const& _type);
+
 	/// @returns a function that reads a type from storage.
 	/// @param _splitFunctionTypes if false, returns the address and function signature in a
 	/// single variable.

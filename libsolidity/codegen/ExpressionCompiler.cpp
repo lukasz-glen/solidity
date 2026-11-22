@@ -146,7 +146,50 @@ void ExpressionCompiler::appendStateVariableAccessor(VariableDeclaration const& 
 	}
 
 	Type const* returnType = _varDecl.annotation().type;
+	// True once the slot is a StorageLayoutV2 mapping descriptor.
+	bool slotIsMappingRef = false;
 
+	// A getter whose every parameter is a mapping key computes the entry slot
+	// directly. Trailing static-array indexes still walk the descriptor.
+	bool const v2Direct = StorageLayoutScope::active();
+	size_t directLevels = 0;
+	if (v2Direct)
+	{
+		Type const* advanced = returnType;
+		while (dynamic_cast<MappingType const*>(advanced))
+		{
+			++directLevels;
+			advanced = dynamic_cast<MappingType const&>(*advanced).valueType();
+		}
+	}
+	if (v2Direct && directLevels > 0 && directLevels == paramTypes.size())
+	{
+		m_context << Instruction::POP;
+		std::vector<std::string> keyNames;
+		std::vector<std::string> locals;
+		for (size_t i = 0; i < directLevels; ++i)
+		{
+			solAssert(paramTypes[i]->sizeOnStack() == 1, "");
+			keyNames.emplace_back("key" + std::to_string(i));
+			locals.push_back(keyNames.back());
+		}
+		locals.emplace_back("slot");
+		auto const& rootMapping = dynamic_cast<MappingType const&>(*_varDecl.annotation().type);
+		m_context.appendInlineAssembly(
+			"{\n" + m_context.utilFunctions().mappingDirectSlotCode(
+				rootMapping,
+				"slot",
+				keyNames,
+				"slot"
+			) + "}\n",
+			locals
+		);
+		m_context << u256(0);
+		for (size_t i = 0; i < directLevels; ++i)
+			returnType = dynamic_cast<MappingType const&>(*returnType).valueType();
+	}
+	else
+	{
 	for (size_t i = 0; i < paramTypes.size(); ++i)
 	{
 		if (auto mappingType = dynamic_cast<MappingType const*>(returnType))
@@ -156,6 +199,11 @@ void ExpressionCompiler::appendStateVariableAccessor(VariableDeclaration const& 
 
 			// pop offset
 			m_context << Instruction::POP;
+			bool const v2 = StorageLayoutScope::active();
+			solAssert(
+				!v2 || !paramTypes[i]->isDynamicallySized(),
+				"Dynamically sized mapping keys are forbidden under StorageLayoutV2."
+			);
 			if (paramTypes[i]->isDynamicallySized())
 			{
 				solAssert(
@@ -186,18 +234,46 @@ void ExpressionCompiler::appendStateVariableAccessor(VariableDeclaration const& 
 			{
 				solAssert(paramTypes[i]->isValueType(), "Expected value type for mapping key");
 
-				// move storage offset to memory.
-				utils().storeInMemory(32);
+				if (v2)
+				{
+					// Stack: <keys...> <slot>. Turn a raw slot into a descriptor,
+					// then append this key. Nested mappings keep the descriptor.
+					if (!slotIsMappingRef)
+						m_context.callYulFunction(
+							m_context.utilFunctions().mappingStorageRefFunction(*mappingType),
+							1,
+							1
+						);
+					solAssert(paramTypes[i]->sizeOnStack() == 1, "");
+					utils().copyToStackTop(static_cast<unsigned>(paramTypes.size() - i + 1), 1);
+					// Yul reads the first argument from the top of the stack.
+					m_context << Instruction::SWAP1;
+					m_context.callYulFunction(
+						m_context.utilFunctions().mappingIndexAccessFunction(
+							*mappingType,
+							*paramTypes[i]
+						),
+						2,
+						1
+					);
+				}
+				else
+				{
+					// move storage offset to memory.
+					utils().storeInMemory(32);
 
-				// move key to memory.
-				utils().copyToStackTop(static_cast<unsigned>(paramTypes.size() - i), 1);
-				utils().storeInMemory(0);
-				m_context << u256(64) << u256(0);
-				m_context << Instruction::KECCAK256;
+					// move key to memory.
+					utils().copyToStackTop(static_cast<unsigned>(paramTypes.size() - i), 1);
+					utils().storeInMemory(0);
+					m_context << u256(64) << u256(0);
+					m_context << Instruction::KECCAK256;
+				}
 			}
 
 			// push offset
 			m_context << u256(0);
+			slotIsMappingRef =
+				v2 && mappingType->valueType()->category() == Type::Category::Mapping;
 			returnType = mappingType->valueType();
 		}
 		else if (auto arrayType = dynamic_cast<ArrayType const*>(returnType))
@@ -221,6 +297,7 @@ void ExpressionCompiler::appendStateVariableAccessor(VariableDeclaration const& 
 		}
 		else
 			solAssert(false, "Index access is allowed only for \"mapping\" and \"array\" types.");
+	}
 	}
 	// remove index arguments.
 	if (paramTypes.size() == 1)
@@ -2216,9 +2293,69 @@ bool ExpressionCompiler::visit(MemberAccess const& _memberAccess)
 	return false;
 }
 
+void ExpressionCompiler::appendDirectMappingIndex(DirectStorageMappingIndex const& _direct)
+{
+	auto const& rootType = dynamic_cast<MappingType const&>(*type(*_direct.root));
+	if (auto const* identifier = dynamic_cast<Identifier const*>(_direct.root))
+	{
+		auto const* variable = dynamic_cast<VariableDeclaration const*>(
+			identifier->annotation().referencedDeclaration
+		);
+		solAssert(variable, "");
+		auto const& location = m_context.storageLocationOfVariable(*variable);
+		solAssert(location.second == 0, "");
+		m_context << location.first;
+	}
+	else
+	{
+		auto const& member = dynamic_cast<MemberAccess const&>(*_direct.root);
+		member.expression().accept(*this);
+		auto const& structType = dynamic_cast<StructType const&>(*type(member.expression()));
+		solAssert(structType.location() == DataLocation::Storage, "");
+		auto const& offsets = structType.storageOffsetsOfMember(member.memberName());
+		solAssert(offsets.second == 0, "");
+		m_context << offsets.first << Instruction::ADD;
+	}
+
+	MappingType const* current = &rootType;
+	std::vector<std::string> keyNames;
+	keyNames.reserve(_direct.keys.size());
+	for (Expression const* key: _direct.keys)
+	{
+		solAssert(current, "");
+		solAssert(current->keyType()->sizeOnStack() == 1, "");
+		acceptAndConvert(*key, *current->keyType());
+		keyNames.emplace_back("key" + std::to_string(keyNames.size()));
+		current = dynamic_cast<MappingType const*>(current->valueType());
+	}
+	solAssert(!current, "");
+
+	std::vector<std::string> locals{"base"};
+	for (std::string const& keyName: keyNames)
+		locals.push_back(keyName);
+	m_context.appendInlineAssembly(
+		"{\n" + m_context.utilFunctions().mappingDirectSlotCode(
+			rootType,
+			"base",
+			keyNames,
+			"base"
+		) + "}\n",
+		locals
+	);
+	for (size_t i = 0; i < keyNames.size(); ++i)
+		m_context << Instruction::POP;
+}
+
 bool ExpressionCompiler::visit(IndexAccess const& _indexAccess)
 {
 	CompilerContext::LocationSetter locationSetter(m_context, _indexAccess);
+	if (std::optional<DirectStorageMappingIndex> direct = directStorageMappingIndex(_indexAccess))
+	{
+		appendDirectMappingIndex(*direct);
+		m_context << u256(0);
+		setLValueToStorageItem(_indexAccess);
+		return false;
+	}
 	_indexAccess.baseExpression().accept(*this);
 
 	Type const& baseType = *_indexAccess.baseExpression().annotation().type;
@@ -2228,9 +2365,34 @@ bool ExpressionCompiler::visit(IndexAccess const& _indexAccess)
 		case Type::Category::Mapping:
 		{
 			// stack: storage_base_ref
-			Type const* keyType = dynamic_cast<MappingType const&>(baseType).keyType();
+			auto const& mappingType = dynamic_cast<MappingType const&>(baseType);
+			Type const* keyType = mappingType.keyType();
+			bool const v2 = StorageLayoutScope::active();
 			solAssert(_indexAccess.indexExpression(), "Index expression expected.");
-			if (keyType->isDynamicallySized())
+			solAssert(
+				!v2 || !keyType->isDynamicallySized(),
+				"Dynamically sized mapping keys are forbidden under StorageLayoutV2."
+			);
+			if (v2)
+			{
+				// stack: descriptor
+				_indexAccess.indexExpression()->accept(*this);
+				Type const& indexType = *_indexAccess.indexExpression()->annotation().type;
+				unsigned const keySize = indexType.sizeOnStack();
+				solAssert(keySize <= 1, "");
+				// Yul reads the first argument, the descriptor, from the top.
+				if (keySize == 1)
+					m_context << Instruction::SWAP1;
+				m_context.callYulFunction(
+					m_context.utilFunctions().mappingIndexAccessFunction(
+						mappingType,
+						indexType
+					),
+					1 + keySize,
+					1
+				);
+			}
+			else if (keyType->isDynamicallySized())
 			{
 				_indexAccess.indexExpression()->accept(*this);
 				utils().fetchFreeMemoryPointer();
@@ -2243,6 +2405,7 @@ bool ExpressionCompiler::visit(IndexAccess const& _indexAccess)
 				m_context << Instruction::SWAP1;
 				utils().storeInMemoryDynamic(*TypeProvider::uint256());
 				utils().toSizeAfterFreeMemoryPointer();
+				m_context << Instruction::KECCAK256;
 			}
 			else
 			{
@@ -2252,10 +2415,17 @@ bool ExpressionCompiler::visit(IndexAccess const& _indexAccess)
 				solAssert(CompilerUtils::freeMemoryPointer >= 0x40, "");
 				utils().storeInMemoryDynamic(*TypeProvider::uint256());
 				m_context << u256(0);
+				m_context << Instruction::KECCAK256;
 			}
-			m_context << Instruction::KECCAK256;
-			m_context << u256(0);
-			setLValueToStorageItem(_indexAccess);
+			bool const nestedResult =
+				v2 &&
+				_indexAccess.annotation().type->category() == Type::Category::Mapping &&
+				!_indexAccess.annotation().willBeWrittenTo;
+			if (!nestedResult)
+			{
+				m_context << u256(0);
+				setLValueToStorageItem(_indexAccess);
+			}
 			break;
 		}
 		case Type::Category::ArraySlice:

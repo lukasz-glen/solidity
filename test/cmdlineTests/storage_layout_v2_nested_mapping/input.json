@@ -1,0 +1,15 @@
+{
+	"language": "Solidity",
+	"sources": {
+		"v2nested.sol": {
+			"content": "// SPDX-License-Identifier: GPL-3.0\npragma solidity >=0.0;\npragma experimental StorageLayoutV2;\ncontract A {\n    uint a;\n    mapping(uint => mapping(uint => uint)) m;\n    uint b;\n}\n"
+		}
+	},
+	"settings": {
+		"outputSelection": {
+			"*": {
+				"*": [ "storageLayout" ]
+			}
+		}
+	}
+}

@@ -23,6 +23,7 @@
 
 #include <libsolidity/codegen/MultiUseYulFunctionCollector.h>
 #include <libsolidity/ast/AST.h>
+#include <libsolidity/ast/ASTUtils.h>
 #include <libsolidity/codegen/CompilerUtils.h>
 #include <libsolidity/codegen/ir/IRVariable.h>
 
@@ -2737,10 +2738,98 @@ std::string YulUtilFunctions::bytesOrStringConcatFunction(
 	});
 }
 
+namespace
+{
+
+std::string const c_mask160 = "0xffffffffffffffffffffffffffffffffffffffff";
+
+struct V2KeyInfo
+{
+	unsigned width = 0;
+	bool leftAligned = false;
+};
+
+struct V2ChainInfo
+{
+	std::vector<V2KeyInfo> keys;
+	bool pack = false;
+	bigint valueSlots = 1;
+};
+
+V2KeyInfo v2KeyInfo(Type const& _key)
+{
+	unsigned const width = _key.storageBytes() * 8;
+	solAssert(width >= 1 && width <= 256, "");
+	return {width, _key.leftAligned()};
+}
+
+V2ChainInfo v2MappingChain(MappingType const& _root)
+{
+	V2ChainInfo chain;
+	chain.pack = true;
+	uint64_t bits = 0;
+	MappingType const* current = &_root;
+	while (true)
+	{
+		solAssert(!current->keyType()->isDynamicallySized(), "");
+		chain.keys.push_back(v2KeyInfo(*current->keyType()));
+		bits += chain.keys.back().width;
+		if (bits > 160)
+			chain.pack = false;
+		Type const* value = current->valueType();
+		if (auto const* next = dynamic_cast<MappingType const*>(value))
+			current = next;
+		else
+		{
+			chain.valueSlots = storageSlotCount(*value, true);
+			solAssert(
+				chain.valueSlots >= 1 && chain.valueSlots < (bigint(1) << 256),
+				"Mapping value too large for storage."
+			);
+			break;
+		}
+	}
+	return chain;
+}
+
+std::string v2SignificantBits(std::string const& _value, V2KeyInfo const& _key)
+{
+	if (_key.width == 256)
+		return _value;
+	if (_key.leftAligned)
+		return "shr(" + std::to_string(256 - _key.width) + ", " + _value + ")";
+	u256 const mask = (u256(1) << _key.width) - 1;
+	return "and(" + _value + ", " + toCompactHexWithPrefix(mask) + ")";
+}
+
+std::string v2Scale(std::string _value, bigint const& _slots)
+{
+	if (_slots == 1)
+		return _value;
+	return "mul(" + std::move(_value) + ", " + _slots.str() + ")";
+}
+
+std::string v2MemoryPosition(std::string const& _start, size_t _offset)
+{
+	if (_offset == 0)
+		return _start;
+	return "add(" + _start + ", " + toCompactHexWithPrefix(u256(_offset)) + ")";
+}
+
+}
+
 std::string YulUtilFunctions::mappingIndexAccessFunction(MappingType const& _mappingType, Type const& _keyType)
 {
+	// Experimental StorageLayoutV2 is active.
+	bool const v2 = StorageLayoutScope::active();
 	std::string functionName = "mapping_index_access_" + _mappingType.identifier() + "_of_" + _keyType.identifier();
+	if (v2)
+		functionName += "_storagelayoutv2";
 	return m_functionCollector.createFunction(functionName, [&]() {
+		solAssert(
+			!v2 || !_mappingType.keyType()->isDynamicallySized(),
+			"Dynamically sized mapping keys are forbidden under StorageLayoutV2."
+		);
 		if (_mappingType.keyType()->isDynamicallySized())
 			return Whiskers(R"(
 				function <functionName>(slot <?+key>,</+key> <key>) -> dataSlot {
@@ -2754,11 +2843,12 @@ std::string YulUtilFunctions::mappingIndexAccessFunction(MappingType const& _map
 				{_mappingType.keyType(), TypeProvider::uint256()}
 			))
 			.render();
-		else
+
+		solAssert(CompilerUtils::freeMemoryPointer >= 0x40, "");
+		solAssert(!_mappingType.keyType()->isDynamicallyEncoded(), "");
+		solAssert(_mappingType.keyType()->calldataEncodedSize(false) <= 0x20, "");
+		if (!v2)
 		{
-			solAssert(CompilerUtils::freeMemoryPointer >= 0x40, "");
-			solAssert(!_mappingType.keyType()->isDynamicallyEncoded(), "");
-			solAssert(_mappingType.keyType()->calldataEncodedSize(false) <= 0x20, "");
 			Whiskers templ(R"(
 				function <functionName>(slot <key>) -> dataSlot {
 					mstore(0, <convertedKey>)
@@ -2774,6 +2864,219 @@ std::string YulUtilFunctions::mappingIndexAccessFunction(MappingType const& _map
 				templ("convertedKey", conversionFunction(_keyType, *_mappingType.keyType()) + "(key)");
 			return templ.render();
 		}
+
+		// Tag 0: {0, base, key count, padded keys...}. Tag 1: {1, base, bits, packed}.
+		// The tag belongs to the whole chain and is read at runtime, because one
+		// static mapping type can be reached from either kind of root. A nested
+		// result copies into a new block. A final index only computes the slot.
+		bool const nested = _mappingType.valueType()->category() == Type::Category::Mapping;
+		bigint valueSlots = 1;
+		if (!nested)
+		{
+			valueSlots = storageSlotCount(*_mappingType.valueType(), true);
+			solAssert(
+				valueSlots >= 1 && valueSlots < (bigint(1) << 256),
+				"Mapping value too large for storage."
+			);
+		}
+		solAssert(_keyType.sizeOnStack() <= 1, "");
+		Type const& canonicalKey = *_mappingType.keyType();
+		V2KeyInfo const keyInfo = v2KeyInfo(canonicalKey);
+		std::string const significant = v2SignificantBits("converted", keyInfo);
+		std::string const copyWords = m_functionCollector.createFunction(
+			"mapping_v2_copy_words",
+			[&]() {
+				return std::string(R"(
+					function mapping_v2_copy_words(src, dst, count) {
+						for { let i := 0 } lt(i, count) { i := add(i, 1) } {
+							mstore(dst, mload(src))
+							dst := add(dst, 0x20)
+							src := add(src, 0x20)
+						}
+					}
+				)");
+			}
+		);
+		std::string const hashKeys = m_functionCollector.createFunction(
+			functionName + "_hash",
+			[&]() {
+				std::string code =
+					"function " + functionName + "_hash(ref, converted) -> result {\n" +
+					"let base := mload(add(ref, 0x20))\n" +
+					"let count := mload(add(ref, 0x40))\n" +
+					"let newCount := add(count, 1)\n" +
+					"let length := mul(newCount, 0x20)\n";
+				if (nested)
+					code +=
+						"let newRef := mload(0x40)\n"
+						"mstore(0x40, add(newRef, add(length, 0x60)))\n"
+						"mstore(newRef, 0)\n"
+						"mstore(add(newRef, 0x20), base)\n"
+						"mstore(add(newRef, 0x40), newCount)\n" +
+						copyWords + "(add(ref, 0x60), add(newRef, 0x60), count)\n"
+						"mstore(add(add(newRef, 0x60), mul(count, 0x20)), converted)\n"
+						"result := newRef\n";
+				else
+					code +=
+						"let start := 0\n"
+						"if gt(length, 0x40) {\n"
+						"start := mload(0x40)\n"
+						"mstore(0x40, add(start, length))\n"
+						"}\n" +
+						copyWords + "(add(ref, 0x60), start, count)\n"
+						"mstore(add(start, mul(count, 0x20)), converted)\n"
+						"result := and(keccak256(start, length), " + c_mask160 + ")\n"
+						"result := add(base, " + v2Scale("result", valueSlots) + ")\n";
+				code += "}\n";
+				return code;
+			}
+		);
+		std::string const packKeys = m_functionCollector.createFunction(
+			functionName + "_pack",
+			[&]() {
+				// A 256-bit key occupies the whole packed word. shl(256, x) would be x.
+				bool const replacesWord = keyInfo.width == 256;
+				std::string code =
+					"function " + functionName + "_pack(ref, converted) -> result {\n" +
+					"let base := mload(add(ref, 0x20))\n";
+				if (!replacesWord)
+					code += "let packed := mload(add(ref, 0x60))\n";
+				code +=
+					"let updated := " +
+					(replacesWord ?
+						significant :
+						"or(shl(" + std::to_string(keyInfo.width) + ", packed), " + significant + ")") +
+					"\n";
+				if (nested)
+					code +=
+						"let newRef := mload(0x40)\n"
+						"mstore(0x40, add(newRef, 0x80))\n"
+						"mstore(newRef, 1)\n"
+						"mstore(add(newRef, 0x20), base)\n"
+						"mstore(add(newRef, 0x40), add(mload(add(ref, 0x40)), " +
+						std::to_string(keyInfo.width) + "))\n"
+						"mstore(add(newRef, 0x60), updated)\n"
+						"result := newRef\n";
+				else
+					code += "result := add(base, " + v2Scale("updated", valueSlots) + ")\n";
+				code += "}\n";
+				return code;
+			}
+		);
+		Whiskers templ(R"(
+			function <functionName>(ref <key>) -> dataSlot {
+				let converted := <convertedKey>
+				switch mload(ref)
+				case 0 { dataSlot := <hashKeys>(ref, converted) }
+				case 1 { dataSlot := <packKeys>(ref, converted) }
+				default { revert(0, 0) }
+			}
+		)");
+		templ("functionName", functionName);
+		templ("key", _keyType.sizeOnStack() == 1 ? ", key" : "");
+		if (_keyType.sizeOnStack() == 0)
+			templ("convertedKey", conversionFunction(_keyType, canonicalKey) + "()");
+		else
+			templ("convertedKey", conversionFunction(_keyType, canonicalKey) + "(key)");
+		templ("hashKeys", hashKeys);
+		templ("packKeys", packKeys);
+		return templ.render();
+	});
+}
+
+std::string YulUtilFunctions::mappingDirectSlotCode(
+	MappingType const& _type,
+	std::string const& _base,
+	std::vector<std::string> const& _keys,
+	std::string const& _result
+) const
+{
+	V2ChainInfo const chain = v2MappingChain(_type);
+	solAssert(_keys.size() == chain.keys.size(), "");
+	solAssert(!_keys.empty(), "");
+	if (chain.pack)
+	{
+		std::string packed = v2SignificantBits(_keys.front(), chain.keys.front());
+		for (size_t i = 1; i < _keys.size(); ++i)
+			packed =
+				"or(shl(" + std::to_string(chain.keys[i].width) + ", " + packed + "), " +
+				v2SignificantBits(_keys[i], chain.keys[i]) + ")";
+		return
+			_result + " := add(" + _base + ", " +
+			v2Scale(std::move(packed), chain.valueSlots) + ")\n";
+	}
+
+	bool const scratch = _keys.size() * 32 <= 64;
+	std::string const start = scratch ? std::string("0") : std::string("hashStart");
+	std::string code;
+	if (!scratch)
+		code += "let hashStart := mload(0x40)\n";
+	for (size_t i = 0; i < _keys.size(); ++i)
+		code += "mstore(" + v2MemoryPosition(start, i * 32) + ", " + _keys[i] + ")\n";
+	std::string const length = toCompactHexWithPrefix(u256(_keys.size() * 32));
+	if (!scratch)
+		code += "mstore(0x40, add(hashStart, " + length + "))\n";
+	code +=
+		_result + " := add(" + _base + ", " +
+		v2Scale(
+			"and(keccak256(" + start + ", " + length + "), " + c_mask160 + ")",
+			chain.valueSlots
+		) + ")\n";
+	return code;
+}
+
+std::string YulUtilFunctions::mappingDirectSlotFunction(MappingType const& _type)
+{
+	solAssert(StorageLayoutScope::active(), "");
+	V2ChainInfo const chain = v2MappingChain(_type);
+	std::string const functionName = "mapping_v2_slot_" + _type.identifier();
+	return m_functionCollector.createFunction(functionName, [&]() {
+		std::vector<std::string> keyNames;
+		std::string params = "base";
+		for (size_t i = 0; i < chain.keys.size(); ++i)
+		{
+			keyNames.emplace_back("k" + std::to_string(i));
+			params += ", " + keyNames.back();
+		}
+		return
+			"function " + functionName + "(" + params + ") -> dataSlot {\n" +
+			mappingDirectSlotCode(_type, "base", keyNames, "dataSlot") +
+			"}\n";
+	});
+}
+
+std::string YulUtilFunctions::mappingStorageRefFunction(MappingType const& _type)
+{
+	solAssert(StorageLayoutScope::active(), "");
+	bool const pack = v2MappingChain(_type).pack;
+	std::string const functionName = pack ?
+		"mapping_storage_ref_pack_storagelayoutv2" :
+		"mapping_storage_ref_hash_storagelayoutv2";
+	return m_functionCollector.createFunction(functionName, [&]() {
+		if (pack)
+			return Whiskers(R"(
+				function <functionName>(slot) -> ref {
+					ref := mload(0x40)
+					mstore(ref, 1)
+					mstore(add(ref, 0x20), slot)
+					mstore(add(ref, 0x40), 0)
+					mstore(add(ref, 0x60), 0)
+					mstore(0x40, add(ref, 0x80))
+				}
+			)")
+			("functionName", functionName)
+			.render();
+		return Whiskers(R"(
+			function <functionName>(slot) -> ref {
+				ref := mload(0x40)
+				mstore(ref, 0)
+				mstore(add(ref, 0x20), slot)
+				mstore(add(ref, 0x40), 0)
+				mstore(0x40, add(ref, 0x60))
+			}
+		)")
+		("functionName", functionName)
+		.render();
 	});
 }
 

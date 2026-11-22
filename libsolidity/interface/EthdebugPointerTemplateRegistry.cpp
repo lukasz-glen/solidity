@@ -20,6 +20,7 @@
 #include <libsolidity/interface/EthdebugTypeRegistry.h>
 
 #include <libsolidity/ast/AST.h>
+#include <libsolidity/ast/ASTUtils.h>
 #include <libsolidity/ast/ASTVisitor.h>
 #include <libsolidity/ast/TypeProvider.h>
 #include <libsolidity/ast/Types.h>
@@ -253,6 +254,8 @@ std::string PointerTemplateRegistry::identifier(Type const& _type, DataLocation 
 	switch (_location)
 	{
 	case DataLocation::Storage:
+		if (StorageLayoutScope::active())
+			return "storage-" + typeIdentifier + "-storagelayoutv2";
 		return "storage-" + typeIdentifier;
 	case DataLocation::Transient:
 		return "transient-" + typeIdentifier;
@@ -595,17 +598,103 @@ PointerTemplateRegistry::TemplateDraft PointerTemplateRegistry::buildArrayTempla
 PointerTemplateRegistry::TemplateDraft PointerTemplateRegistry::buildMappingTemplate(MappingType const& _mappingType)
 {
 	std::set<std::string> producedRegions;
-	Pointer::Expression keyExpression = pointer::variable("key");
-	// Value-type keys are hashed as full words; bytes and string keys are
-	// hashed as their raw bytes.
-	if (_mappingType.keyType()->isValueType())
-		keyExpression = pointer::wordSized(std::move(keyExpression));
-	Pointer::Expression valueSlot = pointer::keccak256(make_vector<Pointer::Expression>(
-		std::move(keyExpression),
-		pointer::wordSized(pointer::variable("slot"))
-	));
-	Pointer body = buildStorageComponentPointer(*_mappingType.valueType(), std::move(valueSlot), 0, "value", producedRegions);
-	return TemplateDraft{{"slot", "key"}, std::move(body), std::move(producedRegions)};
+	if (!StorageLayoutScope::active())
+	{
+		Pointer::Expression keyExpression = pointer::variable("key");
+		// Value-type keys are hashed as full words; bytes and string keys are
+		// hashed as their raw bytes.
+		if (_mappingType.keyType()->isValueType())
+			keyExpression = pointer::wordSized(std::move(keyExpression));
+		Pointer::Expression valueSlot = pointer::keccak256(make_vector<Pointer::Expression>(
+			std::move(keyExpression),
+			pointer::wordSized(pointer::variable("slot"))
+		));
+		Pointer body = buildStorageComponentPointer(
+			*_mappingType.valueType(),
+			std::move(valueSlot),
+			0,
+			"value",
+			producedRegions
+		);
+		return TemplateDraft{{"slot", "key"}, std::move(body), std::move(producedRegions)};
+	}
+	solAssert(
+		!_mappingType.keyType()->isDynamicallySized(),
+		"Dynamically sized mapping keys are forbidden under StorageLayoutV2."
+	);
+	// Nested mappings share one range. Keys whose widths sum to at most 160
+	// bits are concatenated (outer key in the higher bits). Wider keys use
+	// slot + (keccak256(k1 || k2 || ...) % 2**160) * leafSlots.
+	std::vector<MappingType const*> chain{&_mappingType};
+	while (auto const* inner = dynamic_cast<MappingType const*>(chain.back()->valueType()))
+	{
+		solAssert(
+			!inner->keyType()->isDynamicallySized(),
+			"Dynamically sized mapping keys are forbidden under StorageLayoutV2."
+		);
+		chain.push_back(inner);
+	}
+	std::vector<std::string> expect{"slot"};
+	unsigned totalKeyBits = 0;
+	for (MappingType const* mapping: chain)
+	{
+		unsigned const bytes = mapping->keyType()->storageBytes();
+		solAssert(bytes >= 1 && bytes <= 32, "");
+		totalKeyBits += bytes * 8;
+	}
+	bool const packKeys = totalKeyBits <= 160;
+	Pointer::Operands hashedKeys;
+	Pointer::Expression packed = pointer::literal(0);
+	for (size_t i = 0; i < chain.size(); ++i)
+	{
+		std::string name = i == 0 ? "key" : "key" + std::to_string(i + 1);
+		expect.push_back(name);
+		Type const& keyType = *chain[i]->keyType();
+		Pointer::Expression keyExpr = pointer::variable(name);
+		// ~wordsized right-aligns: the significant bits sit in the low bytes.
+		if (keyType.isValueType())
+			keyExpr = pointer::wordSized(std::move(keyExpr));
+		if (packKeys)
+		{
+			unsigned const bits = keyType.storageBytes() * 8;
+			Pointer::Expression sig = pointer::remainder(
+				std::move(keyExpr),
+				pointer::literal(u256(1) << bits)
+			);
+			packed = pointer::sum(
+				pointer::product(std::move(packed), pointer::literal(u256(1) << bits)),
+				std::move(sig)
+			);
+		}
+		else
+			hashedKeys.push_back(std::move(keyExpr));
+	}
+	Type const& leaf = *chain.back()->valueType();
+	bigint const valueSlots = storageSlotCount(leaf, true);
+	solAssert(
+		valueSlots >= 1 && valueSlots < (bigint(1) << 256),
+		"Mapping value too large for storage."
+	);
+	Pointer::Expression masked = packKeys
+		? std::move(packed)
+		: pointer::remainder(
+			pointer::keccak256(std::move(hashedKeys)),
+			pointer::literal(u256(1) << 160)
+		);
+	Pointer::Expression valueSlot = valueSlots == 1
+		? pointer::sum(pointer::variable("slot"), std::move(masked))
+		: pointer::sum(
+			pointer::variable("slot"),
+			pointer::product(std::move(masked), pointer::literal(u256(valueSlots)))
+		);
+	Pointer body = buildStorageComponentPointer(
+		leaf,
+		std::move(valueSlot),
+		0,
+		"value",
+		producedRegions
+	);
+	return TemplateDraft{std::move(expect), std::move(body), std::move(producedRegions)};
 }
 
 Pointer PointerTemplateRegistry::buildDynamicArrayPointer(ArrayType const& _arrayType, std::set<std::string>& _producedRegions)
